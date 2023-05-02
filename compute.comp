@@ -1,0 +1,236 @@
+#version 430 core
+layout (local_size_x = 32, local_size_y = 18, local_size_z = 1) in;
+layout (rgba32f, binding = 0) uniform image2D u_img_out;
+layout (binding = 1) uniform sampler3D u_volume_data;
+layout (binding = 2) uniform sampler1D u_tfunc;
+
+struct Ray {
+	int id;
+	vec3 origin, direction;
+	float t_min, t_max;
+};
+
+struct Intersection {
+	vec4 albedo;
+	float t;
+};
+
+
+uniform vec3 u_cam_eye, u_cam_w, u_cam_u, u_cam_v;
+uniform vec2 u_canvas;
+
+uniform vec2 u_xslice, u_yslice, u_zslice;
+
+uniform vec3 u_volume_true_size;
+
+uniform mat4 u_volume_inv_matrix;
+
+#define M_PI 3.1415926535897932384626433832795
+int SAMPLE_COUNT = 2;
+
+float INFINITY = 1e15;
+float EPSILON = 1e-15;
+float WEAK_EPSILON = 1e-3;
+
+float i_min(float x, float y) {
+	return x < y ? x : y;
+}
+
+float i_max(float x, float y) {
+	return x > y ? x : y;
+}
+
+Ray generateRay(vec2 NDC, int id) {
+	Ray ray;
+	ray.id = id;
+	ray.origin = u_cam_eye;
+	ray.direction = normalize(-u_cam_w + NDC.y * u_canvas.y/2.0 * u_cam_v + NDC.x * u_canvas.x/2.0 * u_cam_u);
+	ray.t_min = WEAK_EPSILON, ray.t_max = INFINITY;
+	return ray;
+}
+
+Ray localizeRay(Ray ray, mat4 inverse) {
+	Ray local_ray;
+	local_ray.id = ray.id;
+	local_ray.origin = (inverse * vec4(ray.origin, 1.0)).xyz;
+	local_ray.direction = (inverse * vec4(ray.direction, 0.0)).xyz;
+	local_ray.t_min = ray.t_min, local_ray.t_max = ray.t_max;
+	return local_ray;
+}
+
+int BASES_COUNT = 20;
+uint bases[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71};
+
+float RadicalInverseSpecialized(uint a, uint base) {
+	const float inv_base = float(1) / float(base);
+	uint reversed_digits = 0;
+	float inv_base_n = 1;
+	while (a > 0) {
+		uint next = a / base;
+		uint digit = a - next * base;
+		reversed_digits = reversed_digits * base + digit;
+		inv_base_n *= inv_base;
+		a = next;
+	}
+	return min(reversed_digits * inv_base_n, 1.0 - EPSILON);
+}
+
+uint InverseRadicalInverse(uint inverse, uint base, int n_digits) {
+	uint index = 0;
+	for (int i = 0; i < n_digits; ++i) {
+		uint digit = inverse % base;
+		inverse /= base;
+		index = index * base + digit;
+	}
+	return index;
+}
+// ----------------------------------------------------------------------------
+float Halton1D(uint i, uint base) {
+	// discard first 20 samples for safety
+	return RadicalInverseSpecialized(i+20, bases[base]);
+}
+
+vec2 Halton2D(uint i, uint base) {
+	// discard first 20 samples for safety
+	return vec2(RadicalInverseSpecialized(i+20, bases[base]), RadicalInverseSpecialized(i+20, bases[base+1]));
+}
+
+vec3 sphericalToCartesian(float cosTheta, float sinTheta, float phi) {
+	vec3 result;
+	/* physically
+	 * result.x = cos(phi)*sinTheta;
+	 * result.y = sin(phi)*sinTheta;
+	 * result.z = cosTheta;
+	*/
+	// since y is up, and z is forward
+	result.x = sin(phi)*sinTheta;
+	result.y = cosTheta;
+	result.z = cos(phi)*sinTheta;
+	return result;
+}
+
+float shade(vec3 position, vec3 V) {
+	float g_xpos = texture(u_volume_data, position+vec3(WEAK_EPSILON, 0.0, 0.0)).r;
+	float g_xneg = texture(u_volume_data, position-vec3(WEAK_EPSILON, 0.0, 0.0)).r;
+	float g_ypos = texture(u_volume_data, position+vec3(0.0, WEAK_EPSILON, 0.0)).r;
+	float g_yneg = texture(u_volume_data, position-vec3(0.0, WEAK_EPSILON, 0.0)).r;
+	float g_zpos = texture(u_volume_data, position+vec3(0.0, 0.0, WEAK_EPSILON)).r;
+	float g_zneg = texture(u_volume_data, position-vec3(0.0, 0.0, WEAK_EPSILON)).r;
+	
+	vec3 gradient = vec3(g_xneg - g_xpos, g_yneg - g_ypos, g_zneg - g_zpos);
+	gradient = (normalize(gradient) + 1.0) / 2.0;
+	vec3 N = 2.0 * gradient - 1.0;
+
+	vec3 L = normalize(V);
+	float dot_nl = clamp(dot(N, L), 0.0, 1.0);
+	float dot_nh = dot_nl;
+	return 0.5 * (dot_nl + pow(dot_nh, 16.0));
+}
+
+bool inbounds(vec3 point) {
+	bool inx = max(-1.0, 2.0 * (u_xslice.x - 0.5)) <= point.x && point.x <= min(1.0, 2.0 * (u_xslice.y - 0.5));
+	bool iny = max(-1.0, 2.0 * (u_yslice.x - 0.5)) <= point.y && point.y <= min(1.0, 2.0 * (u_yslice.y - 0.5));
+	bool inz = max(-1.0, 2.0 * (u_zslice.x - 0.5)) <= point.z && point.z <= min(1.0, 2.0 * (u_zslice.y - 0.5));
+	return inx && iny && inz;
+}
+
+bool intersectAABB(Ray ray, inout Intersection ir) {
+	vec3 inv_d = ivec3(1) / ray.direction;
+	
+	for (int i = 0; i < 3; ++i) {
+		if (-EPSILON <= ray.direction[i] && ray.direction[i] < 0.0) {
+			inv_d[i] = -INFINITY;
+		} else if (0.0 <= ray.direction[i] && ray.direction[i] <= EPSILON) {
+			inv_d[i] = INFINITY;
+		}
+	}
+
+	float t_min = 0.0, t_max = INFINITY;
+	if (ray.origin.x < -1.0 || ray.origin.y < -1.0 || ray.origin.z < -1.0 || 
+		ray.origin.x > 1.0 || ray.origin.y > 1.0 || ray.origin.z > 1.0) {
+		vec3 b_min = max(vec3(-1.0), 2.0 * vec3(u_xslice.x, u_yslice.x, u_zslice.x) - 1.0);
+		vec3 b_max = min(vec3(1.0), 2.0 * vec3(u_xslice.y, u_yslice.y, u_zslice.y) - 1.0);
+		b_min = (b_min - ray.origin) * inv_d;
+		b_max = (b_max - ray.origin) * inv_d;
+
+		// Method described in https://tavianator.com/2022/ray_box_boundary.html
+		// Alternate method is described in "An Efficient and Robust Ray–Box Intersection Algorithm"
+		
+		for (int i = 0; i < 3; ++i) {
+			t_min = i_min(i_max(b_min[i], t_min), i_max(b_max[i], t_min));
+			t_max = i_max(i_min(b_min[i], t_max), i_min(b_max[i], t_max));
+		}
+	
+		if (t_min <= ray.t_min || t_min >= ray.t_max || t_min > t_max)
+			return false;
+	}
+
+	
+	float step_size = 0.005;
+	vec3 current_point = ray.origin + (t_min + WEAK_EPSILON) * ray.direction;
+	vec3 delta_point = step_size * ray.direction;
+
+	while (inbounds(current_point) && ir.albedo.a < 0.99) {		
+		vec3 texture_point = (current_point + 1.0)/2.0;
+		float iso_value = texture(u_volume_data, texture_point).r;
+
+		vec4 tfunc_value = texture(u_tfunc, iso_value);
+
+		// shade(texture_point, -ray.direction)
+		if (tfunc_value.a > 0.0) {
+			ir.albedo.rgb += (1.0 - ir.albedo.a) * tfunc_value.rgb * tfunc_value.a;
+			ir.albedo.a += tfunc_value.a * (1.0 - ir.albedo.a);
+		}
+
+		current_point += delta_point;
+	}
+
+	return true;
+}
+
+
+bool intersectVolume(Ray ray, inout Intersection ir) {
+	bool intersection = false;
+
+	Ray local_ray = localizeRay(ray, u_volume_inv_matrix);
+	if (intersectAABB(local_ray, ir)) {
+		intersection = true;
+	}
+
+	return intersection;
+}
+
+vec4 traceRay(Ray ray) {
+	Intersection ir;
+	ir.albedo = vec4(0.0, 0.0, 0.0, 0.0);
+	intersectVolume(ray, ir);
+	return ir.albedo;
+}
+
+vec4 getPixelColor(vec2 NDC, int id) {
+	Ray ray = generateRay(NDC, id);
+	return traceRay(ray);
+}
+
+void main() {
+	ivec2 img_size = imageSize(u_img_out);
+	vec2 pixel = gl_GlobalInvocationID.xy;
+
+	int pixel_id = int(pixel.x) + int(pixel.y) * img_size.x;
+
+	vec4 accum_color = vec4(0.0);
+	for (int i = 0; i < SAMPLE_COUNT; ++i) {
+		for (int j = 0; j < SAMPLE_COUNT; ++j) {
+			int id = SAMPLE_COUNT * SAMPLE_COUNT + i * SAMPLE_COUNT + j;
+			vec2 offs = vec2(j, i);
+			offs += Halton2D(id, pixel_id % (BASES_COUNT-1));
+			offs /= SAMPLE_COUNT;
+			vec2 n_pixel = vec2((pixel.x+offs.x)/img_size.x, (pixel.y+offs.y)/img_size.y);
+			vec2 NDC = 2.0 * n_pixel - 1.0;
+			accum_color += getPixelColor(NDC, id);
+		}
+	}
+	accum_color /= SAMPLE_COUNT*SAMPLE_COUNT;
+	accum_color = clamp(accum_color, 0.0, 1.0);
+	imageStore(u_img_out, ivec2(pixel), vec4(accum_color.rgb, 1.0));
+}
