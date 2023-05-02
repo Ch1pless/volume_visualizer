@@ -1,4 +1,4 @@
-# volume_visualizer
+# Volume Visualizer
 
 ![Jet Color Foot](jet_color_foot.png)
 
